@@ -1,0 +1,216 @@
+这是一个针对 **NBA Player Rater** 系统的**详细技术设计文档 (Detailed Technical Design)**。
+
+这份文档是给开发者的具体施工图纸，详细定义了每个 Python 文件内部的类、函数接口、数据结构和核心逻辑。
+
+-----
+
+## 📂 模块 1：配置管理 (Configuration)
+
+**文件路径**: `config/settings.py`
+**职责**: 集中管理所有的常量、权重字典和阈值标准，避免硬编码 (Hard-coding)。
+
+### 1.1 数据结构设计
+
+```python
+# 赛道定义
+ARCHETYPES = ["后卫组 (Guards)", "锋线组 (Wings)", "内线组 (Bigs)"]
+
+# UI 配色方案 (Hex)
+THEME_COLORS = {
+    "后卫组 (Guards)": "#00F0FF", # Cyan
+    "锋线组 (Wings)": "#FF0055",  # Neon Red
+    "内线组 (Bigs)": "#00FF99"    # Neon Green
+}
+
+# 核心权重配置 (Weights Config)
+# 定义每个赛道下，6个维度对 OVR 的贡献比例
+WEIGHTS = {
+    "后卫组 (Guards)": {
+        "Scoring": 0.25, "Playmaking": 0.30, "Defense": 0.15, 
+        "Rebounding": 0.05, "Clutch": 0.10, "Isolation": 0.15
+    },
+    # ... 锋线和内线配置
+}
+
+# 评分映射阈值 (Mapping Thresholds)
+# 格式: [Min(60分), Max(99分)]
+SCORING_THRESHOLDS = {
+    "TS_PCT": {
+        "后卫组 (Guards)": [0.50, 0.65],
+        "锋线组 (Wings)": [0.52, 0.68],
+        "内线组 (Bigs)": [0.55, 0.72]
+    },
+    "AST_PCT": {
+        # ... 对应PRD中的百分比
+    }
+}
+```
+
+-----
+
+## 📂 模块 2：数据访问层 (Data Access Layer)
+
+**文件路径**: `data/fetcher.py`
+**职责**: 处理网络请求、容错、数据清洗 (ETL)。
+
+### 2.1 类设计: `NBADataFetcher`
+
+#### 方法接口 (Methods)
+
+  * `__init__(self)`: 初始化请求头 (Headers)，伪装 User-Agent 防止被封。
+  * `search_player(player_name: str) -> int`:
+      * 利用 `nba_api.stats.static.players`。
+      * 返回 `player_id`，若未找到返回 `None`。
+  * `fetch_season_stats(player_id: int) -> dict`:
+      * **主逻辑**: 调用 `leaguedashplayerstats` 端点。
+      * **容错**: 使用 `try-except` 包裹。如果超时或报错，抛出自定义异常 `APIConnectionError`。
+  * `get_mock_data(player_name: str) -> dict`:
+      * 返回一个预设的 JSON 字典（保底数据）。
+  * `_clean_data(raw_df: DataFrame) -> dict`:
+      * **ETL 逻辑**: 将 API 返回的累积数据转换为场均数据和高阶效率数据。
+      * *计算公式*: `TS% = PTS / (2 * (FGA + 0.44 * FTA))`
+
+### 2.2 核心代码逻辑 (伪代码)
+
+```python
+def fetch_data_pipeline(name):
+    id = search_player(name)
+    if not id: return None
+    
+    try:
+        raw_df = fetch_season_stats(id)
+        clean_stats = _clean_data(raw_df)
+        return {"stats": clean_stats, "source": "real"}
+    except:
+        return {"stats": get_mock_data(name), "source": "mock"}
+```
+
+-----
+
+## 📂 模块 3：业务逻辑层 (Business Logic Layer)
+
+**文件路径**: `logic/calculator.py`
+**职责**: 将清洗后的数据转化为 0-100 的评分。
+
+### 3.1 核心函数
+
+#### `normalize(value, min_val, max_val) -> int`
+
+  * 实现 Min-Max 归一化。
+  * **边界处理**: `max(60, min(99, calculated_score))`。
+
+#### `calculate_sub_scores(stats: dict, archetype: str, sliders: dict) -> dict`
+
+这是整个系统最复杂的部分，包含所有业务规则。
+
+  * **输入**: 基础数据、赛道类型、UI滑块数据。
+  * **逻辑细则**:
+    1.  **Shooting (投射)**:
+          * `base = normalize(3P_PCT)`
+          * `bonus = 3PM * 5` (产量加成)
+          * `total = base + bonus`
+    2.  **Playmaking (组织)**:
+          * `score = normalize(AST_PCT)`
+          * **惩罚逻辑**: `if AST_TO < 2.0: score -= 5`
+    3.  **Defense (防守)**:
+          * `data_score = normalize(STL) + normalize(BLK)`
+          * `final_def = 0.4 * data_score + 0.6 * sliders['def_eye_test']`
+    4.  **其他维度**: 直接调用 `normalize` 配合配置文件的阈值。
+
+#### `get_tier_badge(ovr: int) -> str`
+
+  * 根据 OVR 返回 "T0", "T1", "T2" 等字符串。
+
+-----
+
+## 📂 模块 4：可视化层 (Visualization Layer)
+
+**文件路径**: `logic/visualizer.py`
+**职责**: 使用 Matplotlib 绘制高质量图片。
+
+### 4.1 函数: `draw_radar_chart(scores: dict, color_hex: str) -> Figure`
+
+  * **技术选型**: `matplotlib.pyplot` 极坐标系 (Polar Axes)。
+  * **参数配置**:
+      * `fig.patch.set_alpha(0.0)`: 背景全透明。
+      * `ax.set_facecolor('#1e1e1e')`: 雷达内部深色背景。
+      * `ax.fill(..., alpha=0.4)`: 半透明填充区域。
+      * `plt.ylim(50, 100)`: 锁定刻度范围，让差距更明显。
+      * **Grid线**: 去除杂乱的网格，只保留 60/70/80/90 的同心圆。
+
+-----
+
+## 📂 模块 5：数据存储层 (Storage Layer)
+
+**文件路径**: `data/database.py`
+**职责**: 本地 SQLite 交互，实现每日追踪。
+
+### 5.1 数据库 Schema (SQL)
+
+```sql
+CREATE TABLE IF NOT EXISTS ratings_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_name TEXT,
+    archetype TEXT,
+    ovr_score INTEGER,
+    detail_scores_json TEXT, -- 存储六维小分的 JSON 字符串
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+### 5.2 接口函数
+
+  * `save_rating(name, archetype, ovr, details)`: 插入一条新记录。
+  * `get_player_history(name, limit=7)`:
+      * 查询最近 7 次评分。
+      * 用于前端绘制 "OVR 走势图"。
+
+-----
+
+## 📂 模块 6：表现层 (Presentation Layer)
+
+**文件路径**: `app.py`
+**职责**: 组装所有模块，构建 Streamlit UI。
+
+### 6.1 页面布局流程
+
+1.  **Sidebar**:
+
+      * `st.text_input`: 接收球员名。
+      * `st.selectbox`: 选择赛道 (触发 `config` 加载)。
+      * `st.slider`: 接收主观修正分 (Eye Test)。
+      * `st.button("Analyze")`: 触发分析。
+
+2.  **Main Area (Callback逻辑)**:
+
+      * 调用 `fetch_data_pipeline`。
+      * 检查返回数据的 `source` 字段，如果是 "mock"，显示 `st.warning`。
+      * 调用 `calculate_sub_scores` 和 `calculate_ovr`。
+      * 调用 `draw_radar_chart` 获取 `fig` 对象。
+      * **UI 渲染**:
+          * 使用 `st.columns` 将布局分为 [左：卡片] [右：雷达图]。
+          * 使用 HTML/CSS 渲染自定义的 "2K Style" 评分卡片。
+      * **异步存档**: 调用 `database.save_rating`。
+
+3.  **History Tab (可选)**:
+
+      * 如果数据库中有该球员历史数据，使用 `st.line_chart` 展示 OVR 变化。
+
+-----
+
+### 💡 关键技术难点解决方案
+
+1.  **动态权重加载**:
+
+      * 在 `app.py` 中，当用户改变 Sidebar 的下拉菜单（如从“后卫”切到“内线”）时，Streamlit 会自动重新运行脚本。
+      * 代码逻辑：`current_config = WEIGHTS[selected_archetype]`。
+
+2.  **API 频率限制**:
+
+      * 在 `fetcher.py` 中使用 Streamlit 的缓存装饰器 `@st.cache_data(ttl=3600)`。
+      * 这确保了如果用户在一小时内多次查询 "LeBron James"，系统只会请求一次 NBA 官网，其余时间直接从内存读取，极大提高了速度和稳定性。
+
+3.  **主观与客观的融合**:
+
+      * 在 `calculator.py` 中，防守分数的计算公式设计为：`Def_Score = (Stats_Score * 0.4) + (Slider_Score * 0.6)`。
+      * 这样既保留了盖帽/抢断的数据基础，又赋予了用户手动修正“防守漏勺”的权力。

@@ -1,0 +1,145 @@
+基于您提供的 PRD 文档，以下是 **NBA Player Rater (全维球员评级系统)** 的总体技术架构设计。
+
+该架构采用经典的 **分层架构 (Layered Architecture)** 模式，强调数据获取的稳定性（防崩溃）和计算逻辑的可配置性。
+
+---
+
+### 🏗️ 总体架构图 (System Architecture Diagram)
+
+代码段
+
+# 
+
+`graph TD
+    User[用户 / 创作者] --> UI[表现层: Streamlit UI]
+    
+    subgraph "前端交互层 (Presentation Layer)"
+        UI --> Input[参数输入: 球员/赛道/滑块]
+        UI --> Viz[可视化渲染: 雷达图/评级卡]
+    end
+
+    subgraph "业务逻辑层 (Business Logic Layer)"
+        Input --> Controller[主控制器]
+        Controller --> Engine[评分计算引擎]
+        Engine --> Mapper[线性映射模块 (Min-Max)]
+        Engine --> Weighter[权重配置模块 (JSON/Dict)]
+        Engine --> TierCalc[定级计算器 (Tier)]
+    end
+
+    subgraph "数据访问层 (Data Access Layer)"
+        Controller --> DataManager[数据管理器]
+        DataManager --> Cache[缓存系统 (@st.cache)]
+        DataManager --> API_Client[NBA API 客户端]
+        DataManager --> Fallback[模拟数据生成器 (Mock)]
+        API_Client -- 失败/超时 --> Fallback
+    end
+
+    subgraph "数据存储层 (Storage Layer)"
+        Engine --> DB[(SQLite 本地库)]
+        DB --> TrendAnalysis[趋势分析模块]
+    end
+
+    API_Client <--> NBA_Server[NBA 官方数据库]
+    TrendAnalysis --> Viz`
+
+---
+
+### 🧩 核心模块详解 (Module Breakdown)
+
+我们将系统划分为四个核心层级，以保证代码的低耦合和易维护性。
+
+### 1. 表现层 (Presentation Layer)
+
+- **技术栈**: `Streamlit`
+- **职责**: 处理用户交互和视觉展示。
+- **核心组件**:
+    - **Sidebar Manager**: 管理侧边栏的输入控件（文本框、下拉菜单、滑块）。
+    - **Dashboard View**: 主界面布局，负责将计算结果渲染为 HTML/CSS 卡片。
+    - **Chart Renderer**: 调用 `Matplotlib` 绘制六维雷达图，并将其转换为 Streamlit 可显示的 Image 对象。
+
+### 2. 业务逻辑层 (Business Logic Layer) - **大脑**
+
+- **技术栈**: `Python (Pandas, Numpy)`
+- **职责**: 执行具体的评分算法和规则判断。
+- **核心组件**:
+    - **Mapping Service (映射服务)**: 包含所有 Min-Max 归一化逻辑。例如：`calculate_shooting_score(3p_pct, volume)`。
+    - **Archetype Config (赛道配置)**: 一个静态配置文件（字典），存储“后卫/锋线/内线”的不同权重表。
+    - **Scoring Engine (评分引擎)**:
+        - 输入：原始数据 (Stats) + 赛道 (Archetype) + 主观分 (Eye Test)。
+        - 输出：6个维度的具体得分 (0-99) + OVR 总分。
+
+### 3. 数据访问层 (Data Access Layer) - **采集器**
+
+- **技术栈**: `nba_api`, `Requests`
+- **职责**: 负责从外部获取数据，并保证系统不崩溃。
+- **核心组件**:
+    - **API Client**: 封装 `nba_api` 的调用，自动添加 `Headers` 伪装浏览器。
+    - **Resiliency Handler (容错处理)**: 实现 `try-except` 逻辑。当检测到网络超时或 API 封锁时，自动触发 Fallback 机制。
+    - **Mock Generator**: 备用数据源，生成一套符合逻辑的虚拟数据，确保演示功能可用。
+    - **ETL Processor**: 数据清洗器。将 API 返回的杂乱 JSON 清洗为标准的字典格式（计算 TS%, AST/TO 等）。
+
+### 4. 持久化层 (Storage Layer) - **记忆**
+
+- **技术栈**: `SQLite 3` (Python自带)
+- **职责**: 记录历史评级，用于生成趋势。
+- **数据表结构 (Schema)**:
+    - `history_table`: `id`, `player_name`, `date`, `archetype`, `ovr_score`, `raw_stats_json`
+
+---
+
+### 📂 推荐的代码目录结构 (Directory Structure)
+
+为了便于开发和维护，建议采用以下文件结构：
+
+Plaintext
+
+# 
+
+`NBA_Player_Rater/
+├── app.py                  # [入口] Streamlit 主程序 (UI布局与交互)
+├── requirements.txt        # 依赖库列表
+├── config/
+│   └── weights.py          # [配置] 存放三大赛道的权重字典、颜色代码
+├── logic/
+│   ├── __init__.py
+│   ├── calculator.py       # [逻辑] 核心算法 (Min-Max映射, OVR计算)
+│   └── visualizer.py       # [视觉] Matplotlib 绘图代码
+├── data/
+│   ├── __init__.py
+│   ├── fetcher.py          # [数据] API 调用与 Mock 数据逻辑
+│   └── database.py         # [存储] SQLite 的增删改查操作
+└── assets/
+    └── logo.png            # 项目Logo`
+
+---
+
+### 🔄 核心数据流转流程 (Data Flow)
+
+1. **用户动作**: 用户在 `app.py` 输入 "Luka Doncic" 并点击“生成”。
+2. **数据请求**: `app.py` 调用 `data/fetcher.py`。
+3. **获取策略**:
+    - `fetcher.py` 尝试连接 NBA 官网。
+    - *成功* -> 获取 JSON -> 清洗为 Clean Stats。
+    - *失败* -> 调用 Mock Generator -> 生成 Mock Stats -> 标记 `is_real=False`。
+4. **计算评分**: 数据传入 `logic/calculator.py`。
+    - 加载 `config/weights.py` 中的“后卫”配置。
+    - 执行 Min-Max 映射。
+    - 结合 UI 传入的主观滑块数据。
+    - 输出 `Final Scores` (字典)。
+5. **可视化**: `Final Scores` 传入 `logic/visualizer.py` 生成图表对象。
+6. **结果展示**: `app.py` 接收图表和分数，渲染到前端。
+7. **存档**: 后台静默调用 `data/database.py` 将本次结果存入 SQLite。
+
+---
+
+### 🛡️ 关键技术决策 (Key Technical Decisions)
+
+1. **为什么用 Streamlit 而不是 Vue/React?**
+    - **理由**: Streamlit 是专为数据应用设计的，不需要写 HTML/CSS，开发速度快10倍，且原生支持 Python 数据生态。对于个人创作者工具来说是最佳选择。
+2. **为什么用 SQLite?**
+    - **理由**: 单机应用，无需服务器配置，文件型数据库方便备份和迁移。
+3. **Matplotlib vs Plotly?**
+    - **决策**: 推荐使用 **Matplotlib**。
+    - **理由**: 虽然 Plotly 有交互性，但 Matplotlib 生成静态图片更稳定，且更容易自定义极其复杂的样式（如雷达图的半透明填充、去除网格线等），更适合生成视频所需的“定妆照”素材。
+
+这套架构既满足了你当前的 MVP（最小可行性产品）需求，也为未来增加“历史趋势追踪”留出了接口。
