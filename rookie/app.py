@@ -348,7 +348,7 @@ w_eff = st.sidebar.slider("🎯 进攻效率", 0.0, 1.0, 0.20, 0.05)
 w_def = st.sidebar.slider("🛡️ 个人防守", 0.0, 1.0, 0.10, 0.05)
 w_team = st.sidebar.slider("🏆 球队贡献", 0.0, 1.0, 0.10, 0.05)
 w_dura = st.sidebar.slider("🔋 出勤/稳定", 0.0, 1.0, 0.10, 0.05)
-w_to = st.sidebar.slider("🧠 失误控制", 0.0, 1.0, 0.010, 0.05)
+w_to = st.sidebar.slider("🧠 失误控制", 0.0, 1.0, 0.10, 0.05)
 
 total_w = w_prod + w_eff + w_def + w_to + w_team + w_dura
 if total_w == 0: total_w = 1
