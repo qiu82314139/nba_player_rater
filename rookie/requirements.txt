@@ -4,3 +4,4 @@ numpy>=1.24.0
 matplotlib>=3.7.0
 nba_api>=1.4.1
 requests>=2.31.0
+plotly
