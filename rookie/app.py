@@ -207,7 +207,7 @@ class RookieRankerEngine:
             else:
                 df[f'Z_{col}'] = 0.0
         
-        raw_prod = (df['Z_PTS'] * 2.0) + (df['Z_REB'] * 0.8) + df['Z_AST'] + (df['Z_STL'] * 0.3) + (df['Z_BLK'] * 0.3)
+        raw_prod = (df['Z_PTS'] * 2.0) + (df['Z_REB'] * 0.8) + df['Z_AST'] 
         adjusted_prod = raw_prod * np.where(df['Difficulty_Coef'] > 1, df['Difficulty_Coef'], 0.95)
         df['Score_Prod'] = self.normalize_score(adjusted_prod, scale_factor=4.5)
 
