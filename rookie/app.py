@@ -242,21 +242,35 @@ class RookieRankerEngine:
         raw_team = df['Z_PIE']
         df['Score_Team'] = self.normalize_score(raw_team, scale_factor=1.5)
 
-        # === 维度 6：出勤 ===
+        # === 维度 6：出勤 (绝对比例惩罚版) ===
+        # 修改逻辑：不再使用 Z-Score，而是使用 (GP / Max_GP) 的绝对比例
+        # 这样可以确保打得少的球员（如1场）的分数接近地板分 (40分)
         if not consistency_df.empty:
             df = pd.merge(df, consistency_df, on='PLAYER_ID', how='left')
+            # 只有1场比赛时，标准差为NaN (无法计算波动)，强制填补为 10 (极不稳定)
             df['GmSc_Std'] = df['GmSc_Std'].fillna(10)
         else:
             df['GmSc_Std'] = 10
 
-        if 'GP' in df.columns:
-            df['Z_GP'] = (df['GP'] - df['GP'].mean()) / (df['GP'].std() + 1e-6)
-        else:
-            df['Z_GP'] = 0
+        # 获取当前数据中的最大场次作为标杆 (防止 Max=0)
+        max_gp = df['GP'].max()
+        if pd.isna(max_gp) or max_gp == 0:
+            max_gp = 1
         
-        df['Z_Consist'] = (10 - df['GmSc_Std']) / 5 
-        raw_dura = df['Z_GP'] + (df['Z_Consist'] * 0.5)
-        df['Score_Dura'] = self.normalize_score(raw_dura, scale_factor=2)
+        # 绝对出勤分计算：
+        # 基础分 = 40 (地板分)
+        # 奖励分 = (个人场次 / 标杆场次) * 60
+        # 例子：标杆20场。
+        # 打1场: 40 + (1/20)*60 = 43分 -> 这样远低于之前的 59 分
+        df['Score_GP_Abs'] = 40 + (df['GP'] / max_gp) * 60
+        
+        # 稳定性微调 (权重很小，主要看场次)
+        # (10 - Std) / 2 -> 最多 +5分 (Std=0), 最少 0分 (Std=10)
+        # 对于只打1场的球员，Std=10，Bonus=0，总分就是 43 分
+        df['Bonus_Consist'] = (10 - df['GmSc_Std']).clip(0, 10) / 2
+        
+        df['Score_Dura'] = df['Score_GP_Abs'] + df['Bonus_Consist']
+        df['Score_Dura'] = df['Score_Dura'].clip(40, 100)
 
         # === 总分计算 ===
         df['Final_Score'] = (
@@ -316,9 +330,9 @@ st.sidebar.markdown("**模式：基石球员优先**")
 w_prod = st.sidebar.slider("📊 基础统治力", 0.0, 1.0, 0.40, 0.05)
 w_eff = st.sidebar.slider("🎯 进攻效率", 0.0, 1.0, 0.20, 0.05)
 w_def = st.sidebar.slider("🛡️ 个人防守", 0.0, 1.0, 0.10, 0.05)
-w_team = st.sidebar.slider("🏆 球队贡献", 0.0, 1.0, 0.15, 0.05)
+w_team = st.sidebar.slider("🏆 球队贡献", 0.0, 1.0, 0.10, 0.05)
 w_dura = st.sidebar.slider("🔋 出勤/稳定", 0.0, 1.0, 0.10, 0.05)
-w_to = st.sidebar.slider("🧠 失误控制", 0.0, 1.0, 0.05, 0.05)
+w_to = st.sidebar.slider("🧠 失误控制", 0.0, 1.0, 0.10, 0.05)
 
 total_w = w_prod + w_eff + w_def + w_to + w_team + w_dura
 if total_w == 0: total_w = 1
@@ -387,9 +401,7 @@ season_ranked['Display_Name'] = season_ranked.apply(lambda row: f"{row['CN_Name'
 season_ranked = season_ranked.sort_values(by='Final_Score', ascending=False).reset_index(drop=True)
 
 # === 新增：添加排名和顺位列 ===
-# 排名：直接使用索引+1
 season_ranked['Rank'] = season_ranked.index + 1
-# 顺位：映射 ROOKIE_DRAFT_PICKS
 season_ranked['Pick'] = season_ranked['PLAYER_NAME'].map(ROOKIE_DRAFT_PICKS).fillna(99).astype(int)
 
 # === KPI 展示 ===
