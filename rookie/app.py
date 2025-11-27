@@ -371,41 +371,66 @@ else:
 
 ranker = RookieRankerEngine(season=CURRENT_SEASON)
 
+# 初始化 full_ranked_df 为空，防止 API 失败时报错
+full_ranked_df = pd.DataFrame()
+logs_df = pd.DataFrame()
+
 with st.spinner('正在从 NBA 官方数据库获取实时数据...'):
     # 传入日期参数
     league_df, logs_df = ranker.fetch_data(date_from=date_from_str, date_to=date_to_str)
 
-if league_df.empty:
-    st.error("未获取到数据。可能原因：\n1. 所选时间段内没有比赛。\n2. 赛季尚未开始。\n3. API 连接超时。")
-    st.stop()
-
 # 1. 计算稳定性 (基于所选时间段内的 logs)
 consistency_df = ranker.calculate_consistency(logs_df)
 
-# 2. 应用评分模型
-full_ranked_df = ranker.apply_ranking_model(league_df, consistency_df, weights)
+# 2. 应用评分模型 (如果 league_df 不为空)
+if not league_df.empty:
+    full_ranked_df = ranker.apply_ranking_model(league_df, consistency_df, weights)
 
-# 3. 筛选新秀
-try:
-    # 尝试获取新秀名单
-    players_info = commonallplayers.CommonAllPlayers(is_only_current_season=1, season=CURRENT_SEASON).get_data_frames()[0]
-    rookie_ids = players_info[players_info['FROM_YEAR'].astype(str) == str(ROOKIE_YEAR_EXP)]['PERSON_ID'].tolist()
-    custom_names = list(ROOKIE_POSITIONS.keys())
-    
-    mask = full_ranked_df['PLAYER_ID'].isin(rookie_ids) | full_ranked_df['PLAYER_NAME'].isin(custom_names)
-    season_ranked = full_ranked_df[mask].copy()
-except:
-    season_ranked = full_ranked_df.head(50)
+# 3. 强制筛选：只保留 ROOKIE_POSITIONS 中的球员，缺失的补 0
+# 创建一个包含所有目标新秀的 DataFrame
+all_targets = list(ROOKIE_POSITIONS.keys())
+target_df = pd.DataFrame(all_targets, columns=['PLAYER_NAME'])
 
-# 4. 动态调整场次过滤门槛
-# 如果看的是最近7天，只打1场也能上榜；如果是全赛季，至少打5场
-min_gp = 1 if time_range_option != "赛季至今 (Season)" else 5
-season_ranked = season_ranked[season_ranked['GP'] >= min_gp].copy()
+# Left Join：保留目标名单，匹配不上的会自动产生 NaN
+if not full_ranked_df.empty and 'PLAYER_NAME' in full_ranked_df.columns:
+    season_ranked = pd.merge(target_df, full_ranked_df, on='PLAYER_NAME', how='left')
+else:
+    # 如果 API 彻底失败或没有数据，直接用空数据结构
+    season_ranked = target_df.copy()
+
+# 数据补零逻辑
+# 1. 找出所有数值列，将其 NaN 填补为 0
+numeric_cols = season_ranked.select_dtypes(include=[np.number]).columns
+season_ranked[numeric_cols] = season_ranked[numeric_cols].fillna(0)
+
+# 2. 字符串列填补 (可选)
+if 'POSITION' in season_ranked.columns:
+    season_ranked['POSITION'] = season_ranked['POSITION'].fillna('')
+
+# 3. 恢复/回填 Calc_Pos (计算用位置)
+# 如果数据缺失，Calc_Pos 也会缺失，需要从静态字典回填，否则图表分类会失效
+def get_static_pos(name):
+    raw = ROOKIE_POSITIONS.get(name, 'F')
+    return ranker.simplify_position(raw)
+
+if 'Calc_Pos' not in season_ranked.columns:
+    season_ranked['Calc_Pos'] = None
+
+season_ranked['Calc_Pos'] = season_ranked.apply(
+    lambda x: x['Calc_Pos'] if pd.notna(x['Calc_Pos']) and x['Calc_Pos'] != 0 else get_static_pos(x['PLAYER_NAME']), 
+    axis=1
+)
+
+# 4. 移除场次过滤
+# 既然要求“没找着的直接补0”，意味着即使 GP=0 也要展示，所以不再进行 GP 过滤
+# min_gp = 1 ... (已注释)
 
 # 5. 显示处理
 def process_display(row):
     pos, cn_name = ranker.map_info(row['PLAYER_NAME'])
-    if pos == "N/A": pos = row['POSITION']
+    if pos == "N/A": 
+        # 如果静态表里没有(理论上不会，因为我们是根据静态表筛选的)，尝试用数据里的
+        pos = row.get('POSITION', 'N/A')
     return pd.Series([pos, cn_name])
 
 season_ranked[['Pos_Display', 'CN_Name']] = season_ranked.apply(process_display, axis=1)
@@ -441,10 +466,12 @@ with main_tab1:
         if df.empty:
             st.info("暂无数据")
             return
-        fig = px.bar(df.head(15), x='Final_Score', y='Display_Name', orientation='h',
+        # 过滤掉得分为0的显示，避免图表过于拥挤？或者保留看情况。
+        # 既然用户要求补0，图表里展示0分球员也是合理的，或者只展示前15名
+        fig = px.bar(df.head(20), x='Final_Score', y='Display_Name', orientation='h',
                      color='Score_Prod', color_continuous_scale='Viridis', text_auto='.1f',
                      title=f"排名 {title_suf} (颜色=统治力)")
-        fig.update_layout(yaxis={'categoryorder':'total ascending', 'title':''}, xaxis={'title':'Franchise Player Score'}, height=500)
+        fig.update_layout(yaxis={'categoryorder':'total ascending', 'title':''}, xaxis={'title':'Franchise Player Score'}, height=600)
         st.plotly_chart(fig, use_container_width=True)
 
     with pos_tab1: render_chart(season_ranked, "(全员)")
@@ -473,7 +500,7 @@ with main_tab2:
         fig = go.Figure()
         fig.add_trace(go.Scatterpolar(r=vals1, theta=cats, fill='toself', name=n1))
         fig.add_trace(go.Scatterpolar(r=vals2, theta=cats, fill='toself', name=n2))
-        fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[40, 100])), title="六维能力模型对比", height=500)
+        fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100])), title="六维能力模型对比", height=500)
         st.plotly_chart(fig, use_container_width=True)
 
 with main_tab3:
@@ -500,7 +527,7 @@ with main_tab3:
     st.dataframe(
         show_df,
         column_config={
-            "总分": st.column_config.ProgressColumn("总分", format="%.1f", min_value=40, max_value=100),
+            "总分": st.column_config.ProgressColumn("总分", format="%.1f", min_value=0, max_value=100),
             "出勤分": st.column_config.NumberColumn("出勤分", format="%.1f"),
             "场次": st.column_config.NumberColumn("场次", format="%d"),
             "时间": st.column_config.NumberColumn("时间", format="%.1f"),
@@ -520,5 +547,5 @@ with main_tab3:
         },
         use_container_width=True,
         hide_index=True,
-        height=600
+        height=800
     )
