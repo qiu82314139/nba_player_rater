@@ -236,6 +236,8 @@ class RookieRankerEngine:
 
         # 新秀宽容修正
         raw_eff = np.where(raw_eff < 0, raw_eff * 0.5, raw_eff)
+
+        raw_eff = np.sign(raw_eff) * np.log1p(np.abs(raw_eff))
         
         df['Score_Eff'] = self.normalize_score(raw_eff, scale_factor=1.5)
 
