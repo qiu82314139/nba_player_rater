@@ -40,14 +40,14 @@ ROOKIE_POSITIONS = {
 ROOKIE_CN_NAMES = {
     'Cooper Flagg': '库珀·弗拉格', 'Dylan Harper': '迪伦·哈珀', 'VJ Edgecombe': 'VJ·埃吉康姆', 
     'Kon Knueppel': '康·克努佩尔', 'Ace Bailey': '艾斯·贝利', 'Tre Johnson': '特雷·约翰逊', 
-    'Jeremiah Fears': '杰里米亚·费尔斯', 'Egor Demin': '埃戈尔·德明', 'Collin Murray-Boyles': '科林·默里-博伊尔斯', 
+    'Jeremiah Fears': '杰里米亚·费尔斯', 'Egor Dëmin': '埃戈尔·德明', 'Collin Murray-Boyles': '科林·默里-博伊尔斯', 
     'Khaman Maluach': '卡曼·马鲁阿奇', 'Cedric Coward': '塞德里克·考沃德', 'Noa Essengue': '诺亚·埃森格',
     'Derik Queen': '德里克·奎恩', 'Carter Bryant': '卡特·科比', 'Thomas Sorber': '托马斯·索伯', 
     'Yang Hansen': '杨瀚森', 'Joan Beringer': '琼·贝林格', 'Walter Clayton Jr.': '沃尔特·克莱顿', 
     'Nolan Traoré': '诺兰·特拉奥雷', 'Kasparas Jakučionis': '卡斯帕拉斯·雅库乔尼斯', 'Will Riley': '威尔·莱利', 
     'Drake Powell': '德雷克·鲍威尔', 'Asa Newell': '阿萨·纽维尔', 'Nique Clifford': '尼克·克利福德',
     'Jase Richardson': '杰斯·理查德森', 'Ben Saraf': '本·萨拉夫', 'Danny Wolf': '丹尼·沃尔夫', 
-    'Hugo González': '雨果·冈萨雷斯', 'Liam McNeeley': '利亚姆·麦克尼利', 'Yanic Konan Niederhauser': '亚尼克·科南·尼德豪瑟',
+    'Hugo González': '雨果·冈萨雷斯', 'Liam McNeeley': '利亚姆·麦克尼利', 'Yanic Konan Niederhäuser': '亚尼克·科南·尼德豪瑟',
     'Rasheer Fleming': '拉希尔·弗莱明', 'Noah Penda': '诺亚·彭达', 'Sion James': '锡安·詹姆斯', 
     'Ryan Kalkbrenner': '瑞安·卡尔克布伦纳', 'Johni Broome': '乔尼·布鲁姆', 'Adou Thiero': '阿杜·铁罗', 
     'Chaz Lanier': '查兹·拉尼尔', 'Kam Jones': '卡姆·琼斯', 'Alijah Martin': '阿利亚·马丁',
@@ -190,7 +190,7 @@ class RookieRankerEngine:
         # === 维度 1：基础统治力 (Production) - 40% ===
         metrics_prod = ['PTS', 'REB', 'AST', 'STL', 'BLK']
         
-        # >>> 修复点：显式初始化所有 Z_Columns 为 0.0，防止 KeyError <<<
+        # 显式初始化所有 Z_Columns 为 0.0，防止 KeyError
         for col in metrics_prod:
             df[f'Z_{col}'] = 0.0
             
@@ -208,11 +208,14 @@ class RookieRankerEngine:
                 df[f'Z_{col}'] = 0.0
         
         raw_prod = (df['Z_PTS'] * 2.0) + (df['Z_REB'] * 0.8) + df['Z_AST'] 
+        
+        # 修正逻辑：使用 Difficulty_Coef 进行加成
         adjusted_prod = raw_prod * np.where(df['Difficulty_Coef'] > 1, df['Difficulty_Coef'], 0.95)
+
         df['Score_Prod'] = self.normalize_score(adjusted_prod, scale_factor=4.5)
 
         # === 维度 2：进攻效率 (Efficiency) - 20% ===
-        # >>> 修复点：补上 TSA (真实出手数) 的计算逻辑，防止 KeyError: 'TSA' <<<
+        # 补上 TSA (真实出手数) 的计算逻辑，防止 KeyError: 'TSA'
         if 'FGA' in df.columns and 'FTA' in df.columns:
             df['TSA'] = df['FGA'] + 0.44 * df['FTA']
         else:
@@ -477,10 +480,11 @@ with main_tab3:
     st.subheader("数据监控室")
     st.markdown(f"统计范围: **{date_from_str if date_from_str else '赛季至今'}** 至 **{date_to_str if date_to_str else '今'}**")
     
+    # 增加 MIN (上场时间) 到列列表中，置于 PTS (得分) 之前
     cols = ['Display_Name', 'Pos_Display', 'Final_Score', 
             'Score_Dura',
             'Score_Prod', 'Score_Eff', 'Score_Def', 'Score_TO', 'Score_Team',
-            'GP', 'PTS', 'REB', 'AST', 'STL', 'BLK', 'TOV', 'PLUS_MINUS',
+            'GP', 'MIN', 'PTS', 'REB', 'AST', 'STL', 'BLK', 'TOV', 'PLUS_MINUS',
             'FG_PCT', 'FG3_PCT', 'FT_PCT',
             'USG_PCT', 'PCT_UAST_FGM', 'TS_PCT']
     
@@ -488,7 +492,7 @@ with main_tab3:
         'Display_Name': '球员', 'Pos_Display': '位置', 'Final_Score': '总分',
         'Score_Dura': '出勤分',
         'Score_Prod': '统治', 'Score_Eff': '效率', 'Score_Def': '防守', 'Score_TO': '控失', 'Score_Team': '贡献',
-        'GP': '场次', 'PTS': '得分', 'REB': '篮板', 'AST': '助攻', 'STL': '抢断', 'BLK': '盖帽', 'TOV': '失误', 'PLUS_MINUS': '正负值',
+        'GP': '场次', 'MIN': '时间', 'PTS': '得分', 'REB': '篮板', 'AST': '助攻', 'STL': '抢断', 'BLK': '盖帽', 'TOV': '失误', 'PLUS_MINUS': '正负值',
         'FG_PCT': '投篮%', 'FG3_PCT': '三分%', 'FT_PCT': '罚球%',
         'USG_PCT': '球权%', 'PCT_UAST_FGM': '非助攻%', 'TS_PCT': '真命%'
     })
@@ -499,6 +503,7 @@ with main_tab3:
             "总分": st.column_config.ProgressColumn("总分", format="%.1f", min_value=40, max_value=100),
             "出勤分": st.column_config.NumberColumn("出勤分", format="%.1f"),
             "场次": st.column_config.NumberColumn("场次", format="%d"),
+            "时间": st.column_config.NumberColumn("时间", format="%.1f"),
             "真命%": st.column_config.NumberColumn("真实命中%", format="%.1%"),
             "投篮%": st.column_config.NumberColumn("投篮%", format="%.1%"),
             "三分%": st.column_config.NumberColumn("三分%", format="%.1%"),
