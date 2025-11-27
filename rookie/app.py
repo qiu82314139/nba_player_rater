@@ -16,6 +16,7 @@ st.set_page_config(
 )
 
 # === 2. 静态数据库：位置 & 中文名映射 (2025届) ===
+# 字典的键顺序将被视为模拟选秀顺位
 ROOKIE_POSITIONS = {
     # First Round
     'Cooper Flagg': 'PF/SF', 'Dylan Harper': 'PG/SG', 'VJ Edgecombe': 'SG', 'Kon Knueppel': 'SF/SG',
@@ -36,6 +37,9 @@ ROOKIE_POSITIONS = {
     'Lachlan Olbrich': 'PF/C', 'Will Richard': 'SG', 'Max Shulga': 'SG', 'Saliou Niang': 'SF/PF', 
     'Jahmai Mashack': 'SG/SF'
 }
+
+# 自动生成顺位映射 (基于 ROOKIE_POSITIONS 的顺序)
+ROOKIE_DRAFT_PICKS = {name: i+1 for i, name in enumerate(ROOKIE_POSITIONS.keys())}
 
 ROOKIE_CN_NAMES = {
     'Cooper Flagg': '库珀·弗拉格', 'Dylan Harper': '迪伦·哈珀', 'VJ Edgecombe': 'VJ·埃吉康姆', 
@@ -85,10 +89,6 @@ class RookieRankerEngine:
 
     @st.cache_data(ttl=3600)
     def fetch_data(_self, date_from="", date_to=""):
-        """
-        获取指定时间段的数据。
-        NBA API 格式: MM/DD/YYYY
-        """
         try:
             # 1. 基础数据 (Base)
             base_stats = leaguedashplayerstats.LeagueDashPlayerStats(
@@ -114,7 +114,6 @@ class RookieRankerEngine:
             ).get_data_frames()[0]
 
             # 4. 位置信息 (PlayerIndex)
-            # 位置信息是静态的，不需要日期过滤
             p_index = playerindex.PlayerIndex(season=_self.season, historical_nullable=0).get_data_frames()[0]
             p_pos_df = p_index[['PERSON_ID', 'POSITION']].rename(columns={'PERSON_ID': 'PLAYER_ID'})
 
@@ -128,8 +127,7 @@ class RookieRankerEngine:
             league_df = pd.merge(league_df, p_pos_df, on='PLAYER_ID', how='left')
             league_df['POSITION'] = league_df['POSITION'].fillna('F')
 
-            # 6. 比赛日志 (用于一致性/波动分析)
-            # 也需要按照日期过滤，以计算该期间的方差
+            # 6. 比赛日志
             try:
                 logs = playergamelogs.PlayerGameLogs(
                     season_nullable=_self.season, 
@@ -148,10 +146,8 @@ class RookieRankerEngine:
             return pd.DataFrame(), pd.DataFrame()
 
     def calculate_consistency(self, logs_df):
-        """计算稳定性：GmSc 的标准差"""
         if logs_df.empty: 
             return pd.DataFrame(columns=['PLAYER_ID', 'GmSc_Std'])
-        
         try:
             logs_df['GmSc'] = (logs_df['PTS'] + 0.4 * logs_df['FGM'] - 0.7 * logs_df['FGA'] - 0.4 * (logs_df['FTA'] - logs_df['FTM']) + 
                                0.7 * logs_df['OREB'] + 0.3 * logs_df['DREB'] + logs_df['STL'] + 0.7 * logs_df['AST'] + 
@@ -164,14 +160,10 @@ class RookieRankerEngine:
             return pd.DataFrame(columns=['PLAYER_ID', 'GmSc_Std'])
 
     def normalize_score(self, series, scale_factor=1):
-        """评分映射：70分为基准"""
         score = 70 + (series * 10 / scale_factor)
         return score.clip(40, 100)
 
     def apply_ranking_model(self, league_df, consistency_df, weights):
-        """
-        === 基石球员模型 (Franchise Player Model) ===
-        """
         if league_df.empty: return pd.DataFrame()
         df = league_df.copy()
 
@@ -187,16 +179,13 @@ class RookieRankerEngine:
         df['Z_Difficulty'] = (df['Z_USG'] * 0.6) + (df['Z_UAST'] * 0.4)
         df['Difficulty_Coef'] = 1 + (df['Z_USG'] * 0.15) + (df['Z_UAST'] * 0.05)
 
-        # === 维度 1：基础统治力 (Production) - 40% ===
+        # === 维度 1：基础统治力 (Production) ===
         metrics_prod = ['PTS', 'REB', 'AST', 'STL', 'BLK']
-        
-        # 显式初始化所有 Z_Columns 为 0.0，防止 KeyError
         for col in metrics_prod:
             df[f'Z_{col}'] = 0.0
             
         for col in metrics_prod:
             if col in df.columns:
-                # 增加 try-except 防止 transform 内部错误
                 try:
                     if col == 'BLK': 
                          df[f'Z_{col}'] = df.groupby('Calc_Pos')[col].transform(lambda x: (x - x.mean()) / (x.std() + 0.2)) 
@@ -208,21 +197,16 @@ class RookieRankerEngine:
                 df[f'Z_{col}'] = 0.0
         
         raw_prod = (df['Z_PTS'] * 2.0) + (df['Z_REB'] * 0.8) + df['Z_AST'] 
-        
-        # 修正逻辑：使用 Difficulty_Coef 进行加成
         adjusted_prod = raw_prod * np.where(df['Difficulty_Coef'] > 1, df['Difficulty_Coef'], 0.95)
-
         df['Score_Prod'] = self.normalize_score(adjusted_prod, scale_factor=4.5)
 
-        # === 维度 2：进攻效率 (Efficiency) - 20% ===
-        # 补上 TSA (真实出手数) 的计算逻辑，防止 KeyError: 'TSA'
+        # === 维度 2：进攻效率 ===
         if 'FGA' in df.columns and 'FTA' in df.columns:
             df['TSA'] = df['FGA'] + 0.44 * df['FTA']
         else:
             df['TSA'] = 0.0
 
         df['Pos_Avg_TS'] = df.groupby('Calc_Pos')['TS_PCT'].transform('mean')
-        # 优化：只计算场均上场 > 12 分钟的轮换球员平均值
         rotation_mask = df['MIN'] >= 12.0
         if rotation_mask.any():
             pos_avg_map = df[rotation_mask].groupby('Calc_Pos')['TS_PCT'].mean()
@@ -232,28 +216,17 @@ class RookieRankerEngine:
             df['Pos_Avg_TS'] = df.groupby('Calc_Pos')['TS_PCT'].transform('mean')
 
         df['TS_Diff'] = (df['TS_PCT'] - df['Pos_Avg_TS']) * 100 
-        
-        # 3. 计算 Points Added
-        # 现在 df['TSA'] 已经存在，不会报错了
         raw_eff = df['TSA'] * 2 * (df['TS_PCT'] - df['Pos_Avg_TS'])
-
-        # 新秀宽容修正
         raw_eff = np.where(raw_eff < 0, raw_eff * 0.5, raw_eff)
-
         raw_eff = np.sign(raw_eff) * np.log1p(np.abs(raw_eff))
-        
         df['Score_Eff'] = self.normalize_score(raw_eff, scale_factor=1.5)
 
-        # === 维度 3：防守贡献 (Defense) - 15% ===
+        # === 维度 3：防守贡献 ===
         df['Z_PF_Inv'] = df.groupby('Calc_Pos')['PF'].transform(lambda x: (x.mean() - x) / (x.std() + 1e-6))
-        
-        # 优化：降低防守侵略性数据的权重 (1.5 -> 1.2)
         raw_def = (df['Z_STL'] * 1.2) + (df['Z_BLK'] * 1.2) + (df['Z_REB'] * 0.5) + (df['Z_PF_Inv'] * 0.5)
-        
-        # 优化：提高 scale_factor (3.0 -> 3.5)
         df['Score_Def'] = self.normalize_score(raw_def, scale_factor=3.5)
 
-        # === 维度 4：失误控制 (Turnover) - 5% ===
+        # === 维度 4：失误控制 ===
         if 'AST_TO' in df.columns:
             df['Z_AST_TO'] = df.groupby('Calc_Pos')['AST_TO'].transform(lambda x: (x - x.mean()) / (x.std() + 1e-6))
         else:
@@ -261,7 +234,7 @@ class RookieRankerEngine:
         adjusted_ast_to = df['Z_AST_TO'] + (df['Z_Difficulty'] * 0.5)
         df['Score_TO'] = self.normalize_score(adjusted_ast_to, scale_factor=2)
 
-        # === 维度 5：球队贡献 (Team) - 10% ===
+        # === 维度 5：球队贡献 ===
         if 'PIE' in df.columns:
             df['Z_PIE'] = df.groupby('Calc_Pos')['PIE'].transform(lambda x: (x - x.mean()) / (x.std() + 1e-6))
         else:
@@ -269,24 +242,19 @@ class RookieRankerEngine:
         raw_team = df['Z_PIE']
         df['Score_Team'] = self.normalize_score(raw_team, scale_factor=1.5)
 
-        # === 维度 6：出勤 (Durability) - 10% ===
-        # 合并一致性数据
+        # === 维度 6：出勤 ===
         if not consistency_df.empty:
             df = pd.merge(df, consistency_df, on='PLAYER_ID', how='left')
             df['GmSc_Std'] = df['GmSc_Std'].fillna(10)
         else:
             df['GmSc_Std'] = 10
 
-        # 1. 场次 Z-Score
         if 'GP' in df.columns:
             df['Z_GP'] = (df['GP'] - df['GP'].mean()) / (df['GP'].std() + 1e-6)
         else:
             df['Z_GP'] = 0
         
-        # 2. 稳定性 (GmSc方差) - 越小越好
-        # 归一化方差倒数，或直接用简单的线性映射
-        df['Z_Consist'] = (10 - df['GmSc_Std']) / 5 # 简单估算
-        
+        df['Z_Consist'] = (10 - df['GmSc_Std']) / 5 
         raw_dura = df['Z_GP'] + (df['Z_Consist'] * 0.5)
         df['Score_Dura'] = self.normalize_score(raw_dura, scale_factor=2)
 
@@ -303,17 +271,15 @@ class RookieRankerEngine:
         return df
 
 # === 4. 侧边栏 ===
-# 品牌化 Logo 展示
 if os.path.exists("unnamed.jpg"):
     st.sidebar.image("unnamed.jpg", use_container_width=True)
 else:
-    # 如果图片不存在，显示文字标题作为兜底
     st.sidebar.markdown("# 🏀 篮球星图")
 
 st.sidebar.markdown("### HoopMap Rookie Watch")
 st.sidebar.header("🎛️ 评分模型控制台")
 
-# === 核心功能：时间范围选择 ===
+# === 时间范围选择 ===
 st.sidebar.subheader("📅 统计周期")
 time_range_option = st.sidebar.selectbox(
     "选择时间范围", 
@@ -347,13 +313,12 @@ else:
 st.sidebar.markdown("---")
 st.sidebar.markdown("**模式：基石球员优先**")
 
-# 调整默认权重
 w_prod = st.sidebar.slider("📊 基础统治力", 0.0, 1.0, 0.40, 0.05)
 w_eff = st.sidebar.slider("🎯 进攻效率", 0.0, 1.0, 0.20, 0.05)
 w_def = st.sidebar.slider("🛡️ 个人防守", 0.0, 1.0, 0.10, 0.05)
-w_team = st.sidebar.slider("🏆 球队贡献", 0.0, 1.0, 0.10, 0.05)
+w_team = st.sidebar.slider("🏆 球队贡献", 0.0, 1.0, 0.15, 0.05)
 w_dura = st.sidebar.slider("🔋 出勤/稳定", 0.0, 1.0, 0.10, 0.05)
-w_to = st.sidebar.slider("🧠 失误控制", 0.0, 1.0, 0.10, 0.05)
+w_to = st.sidebar.slider("🧠 失误控制", 0.0, 1.0, 0.05, 0.05)
 
 total_w = w_prod + w_eff + w_def + w_to + w_team + w_dura
 if total_w == 0: total_w = 1
@@ -371,44 +336,32 @@ else:
 
 ranker = RookieRankerEngine(season=CURRENT_SEASON)
 
-# 初始化 full_ranked_df 为空，防止 API 失败时报错
 full_ranked_df = pd.DataFrame()
 logs_df = pd.DataFrame()
 
 with st.spinner('正在从 NBA 官方数据库获取实时数据...'):
-    # 传入日期参数
     league_df, logs_df = ranker.fetch_data(date_from=date_from_str, date_to=date_to_str)
 
-# 1. 计算稳定性 (基于所选时间段内的 logs)
 consistency_df = ranker.calculate_consistency(logs_df)
 
-# 2. 应用评分模型 (如果 league_df 不为空)
 if not league_df.empty:
     full_ranked_df = ranker.apply_ranking_model(league_df, consistency_df, weights)
 
-# 3. 强制筛选：只保留 ROOKIE_POSITIONS 中的球员，缺失的补 0
-# 创建一个包含所有目标新秀的 DataFrame
+# 3. 强制筛选 & 补零
 all_targets = list(ROOKIE_POSITIONS.keys())
 target_df = pd.DataFrame(all_targets, columns=['PLAYER_NAME'])
 
-# Left Join：保留目标名单，匹配不上的会自动产生 NaN
 if not full_ranked_df.empty and 'PLAYER_NAME' in full_ranked_df.columns:
     season_ranked = pd.merge(target_df, full_ranked_df, on='PLAYER_NAME', how='left')
 else:
-    # 如果 API 彻底失败或没有数据，直接用空数据结构
     season_ranked = target_df.copy()
 
-# 数据补零逻辑
-# 1. 找出所有数值列，将其 NaN 填补为 0
 numeric_cols = season_ranked.select_dtypes(include=[np.number]).columns
 season_ranked[numeric_cols] = season_ranked[numeric_cols].fillna(0)
 
-# 2. 字符串列填补 (可选)
 if 'POSITION' in season_ranked.columns:
     season_ranked['POSITION'] = season_ranked['POSITION'].fillna('')
 
-# 3. 恢复/回填 Calc_Pos (计算用位置)
-# 如果数据缺失，Calc_Pos 也会缺失，需要从静态字典回填，否则图表分类会失效
 def get_static_pos(name):
     raw = ROOKIE_POSITIONS.get(name, 'F')
     return ranker.simplify_position(raw)
@@ -421,22 +374,23 @@ season_ranked['Calc_Pos'] = season_ranked.apply(
     axis=1
 )
 
-# 4. 移除场次过滤
-# 既然要求“没找着的直接补0”，意味着即使 GP=0 也要展示，所以不再进行 GP 过滤
-# min_gp = 1 ... (已注释)
-
-# 5. 显示处理
 def process_display(row):
     pos, cn_name = ranker.map_info(row['PLAYER_NAME'])
     if pos == "N/A": 
-        # 如果静态表里没有(理论上不会，因为我们是根据静态表筛选的)，尝试用数据里的
         pos = row.get('POSITION', 'N/A')
     return pd.Series([pos, cn_name])
 
 season_ranked[['Pos_Display', 'CN_Name']] = season_ranked.apply(process_display, axis=1)
 season_ranked['Display_Name'] = season_ranked.apply(lambda row: f"{row['CN_Name']} ({row['PLAYER_NAME']})" if row['CN_Name'] != row['PLAYER_NAME'] else row['PLAYER_NAME'], axis=1)
 
+# 排序
 season_ranked = season_ranked.sort_values(by='Final_Score', ascending=False).reset_index(drop=True)
+
+# === 新增：添加排名和顺位列 ===
+# 排名：直接使用索引+1
+season_ranked['Rank'] = season_ranked.index + 1
+# 顺位：映射 ROOKIE_DRAFT_PICKS
+season_ranked['Pick'] = season_ranked['PLAYER_NAME'].map(ROOKIE_DRAFT_PICKS).fillna(99).astype(int)
 
 # === KPI 展示 ===
 col1, col2, col3, col4 = st.columns(4)
@@ -450,7 +404,6 @@ if not season_ranked.empty:
     def_king = season_ranked.sort_values('Score_Def', ascending=False).iloc[0]
     col3.metric("🛡️ 铁闸", def_king['CN_Name'], f"评 {def_king['Score_Def']:.1f}")
     
-    # 在短期榜单中，显示谁打的比赛最多
     iron_man = season_ranked.sort_values('GP', ascending=False).iloc[0]
     col4.metric("🔋 劳模", iron_man['CN_Name'], f"{iron_man['GP']} 场")
 
@@ -466,8 +419,6 @@ with main_tab1:
         if df.empty:
             st.info("暂无数据")
             return
-        # 过滤掉得分为0的显示，避免图表过于拥挤？或者保留看情况。
-        # 既然用户要求补0，图表里展示0分球员也是合理的，或者只展示前15名
         fig = px.bar(df.head(20), x='Final_Score', y='Display_Name', orientation='h',
                      color='Score_Prod', color_continuous_scale='Viridis', text_auto='.1f',
                      title=f"排名 {title_suf} (颜色=统治力)")
@@ -490,7 +441,6 @@ with main_tab2:
     with c2:
         def get_radar_vals(name):
             r = season_ranked[season_ranked['Display_Name'] == name].iloc[0]
-            # 返回 6 个维度的归一化分数
             return [r['Score_Prod'], r['Score_Eff'], r['Score_Def'], r['Score_TO'], r['Score_Team'], r['Score_Dura']], r['CN_Name']
 
         vals1, n1 = get_radar_vals(p1)
@@ -507,8 +457,8 @@ with main_tab3:
     st.subheader("数据监控室")
     st.markdown(f"统计范围: **{date_from_str if date_from_str else '赛季至今'}** 至 **{date_to_str if date_to_str else '今'}**")
     
-    # 增加 MIN (上场时间) 到列列表中，置于 PTS (得分) 之前
-    cols = ['Display_Name', 'Pos_Display', 'Final_Score', 
+    # 增加 Rank (排名) 和 Pick (顺位)
+    cols = ['Rank', 'Pick', 'Display_Name', 'Pos_Display', 'Final_Score', 
             'Score_Dura',
             'Score_Prod', 'Score_Eff', 'Score_Def', 'Score_TO', 'Score_Team',
             'GP', 'MIN', 'PTS', 'REB', 'AST', 'STL', 'BLK', 'TOV', 'PLUS_MINUS',
@@ -516,6 +466,7 @@ with main_tab3:
             'USG_PCT', 'PCT_UAST_FGM', 'TS_PCT']
     
     show_df = season_ranked[cols].rename(columns={
+        'Rank': '排名', 'Pick': '顺位',
         'Display_Name': '球员', 'Pos_Display': '位置', 'Final_Score': '总分',
         'Score_Dura': '出勤分',
         'Score_Prod': '统治', 'Score_Eff': '效率', 'Score_Def': '防守', 'Score_TO': '控失', 'Score_Team': '贡献',
@@ -527,6 +478,8 @@ with main_tab3:
     st.dataframe(
         show_df,
         column_config={
+            "排名": st.column_config.NumberColumn("排名", format="#%d"),
+            "顺位": st.column_config.NumberColumn("顺位", format="#%d"),
             "总分": st.column_config.ProgressColumn("总分", format="%.1f", min_value=0, max_value=100),
             "出勤分": st.column_config.NumberColumn("出勤分", format="%.1f"),
             "场次": st.column_config.NumberColumn("场次", format="%d"),
