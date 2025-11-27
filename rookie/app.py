@@ -242,35 +242,32 @@ class RookieRankerEngine:
         raw_team = df['Z_PIE']
         df['Score_Team'] = self.normalize_score(raw_team, scale_factor=1.5)
 
-        # === 维度 6：出勤 (绝对比例惩罚版) ===
-        # 修改逻辑：不再使用 Z-Score，而是使用 (GP / Max_GP) 的绝对比例
-        # 这样可以确保打得少的球员（如1场）的分数接近地板分 (40分)
+        # === 维度 6：出勤 (指数幂律模型) ===
+        # 修改为指数(幂函数)增长模式，范围 0-100
+        # Formula: 100 * (GP / Max_GP) ^ 2.5
         if not consistency_df.empty:
             df = pd.merge(df, consistency_df, on='PLAYER_ID', how='left')
-            # 只有1场比赛时，标准差为NaN (无法计算波动)，强制填补为 10 (极不稳定)
             df['GmSc_Std'] = df['GmSc_Std'].fillna(10)
         else:
             df['GmSc_Std'] = 10
 
-        # 获取当前数据中的最大场次作为标杆 (防止 Max=0)
         max_gp = df['GP'].max()
         if pd.isna(max_gp) or max_gp == 0:
             max_gp = 1
         
-        # 绝对出勤分计算：
-        # 基础分 = 40 (地板分)
-        # 奖励分 = (个人场次 / 标杆场次) * 60
-        # 例子：标杆20场。
-        # 打1场: 40 + (1/20)*60 = 43分 -> 这样远低于之前的 59 分
-        df['Score_GP_Abs'] = 40 + (df['GP'] / max_gp) * 60
+        # 幂律计算：k=2.5
+        # GP=1, Max=20 -> (0.05)^2.5 = 0.0005 -> 0.05分
+        # GP=10, Max=20 -> (0.5)^2.5 = 0.176 -> 17.6分
+        # GP=18, Max=20 -> (0.9)^2.5 = 0.768 -> 76.8分
+        k_exponent = 2.5
+        df['Score_GP_Exp'] = 100 * ((df['GP'] / max_gp) ** k_exponent)
         
-        # 稳定性微调 (权重很小，主要看场次)
-        # (10 - Std) / 2 -> 最多 +5分 (Std=0), 最少 0分 (Std=10)
-        # 对于只打1场的球员，Std=10，Bonus=0，总分就是 43 分
+        # 稳定性加成 (作为微调，最大加5分)
         df['Bonus_Consist'] = (10 - df['GmSc_Std']).clip(0, 10) / 2
         
-        df['Score_Dura'] = df['Score_GP_Abs'] + df['Bonus_Consist']
-        df['Score_Dura'] = df['Score_Dura'].clip(40, 100)
+        df['Score_Dura'] = df['Score_GP_Exp'] + df['Bonus_Consist']
+        # 取消 40 分限制，改为 0-100
+        df['Score_Dura'] = df['Score_Dura'].clip(0, 100)
 
         # === 总分计算 ===
         df['Final_Score'] = (
