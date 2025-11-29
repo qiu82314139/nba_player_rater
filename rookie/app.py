@@ -20,13 +20,13 @@ st.set_page_config(
 ROOKIE_POSITIONS = {
     # First Round
     'Cooper Flagg': 'PF/SF', 'Dylan Harper': 'PG/SG', 'VJ Edgecombe': 'SG', 'Kon Knueppel': 'SF/SG',
-    'Ace Bailey': 'SF/PF', 'Tre Johnson': 'SG', 'Jeremiah Fears': 'PG', 'Egor Demin': 'PG/SF',
+    'Ace Bailey': 'SF/PF', 'Tre Johnson': 'SG', 'Jeremiah Fears': 'PG', 'Egor Dëmin': 'PG/SF',
     'Collin Murray-Boyles': 'PF/C', 'Khaman Maluach': 'C', 'Cedric Coward': 'SF/PF', 'Noa Essengue': 'PF',
     'Derik Queen': 'C', 'Carter Bryant': 'SF/PF', 'Thomas Sorber': 'C', 'Yang Hansen': 'C',
     'Joan Beringer': 'C/PF', 'Walter Clayton Jr.': 'PG/SG', 'Nolan Traoré': 'PG', 'Kasparas Jakučionis': 'PG',
     'Will Riley': 'SF', 'Drake Powell': 'SF/SG', 'Asa Newell': 'PF', 'Nique Clifford': 'SG/SF',
     'Jase Richardson': 'PG/SG', 'Ben Saraf': 'PG/SG', 'Danny Wolf': 'C/PF', 'Hugo González': 'SF',
-    'Liam McNeeley': 'SF', 'Yanic Konan Niederhauser': 'C',
+    'Liam McNeeley': 'SF', 'Yanic Konan Niederhäuser': 'C',
     # Second Round
     'Rasheer Fleming': 'PF', 'Noah Penda': 'SF', 'Sion James': 'SG/SF', 'Ryan Kalkbrenner': 'C', 
     'Johni Broome': 'PF/C', 'Adou Thiero': 'SF/PF', 'Chaz Lanier': 'SG', 'Kam Jones': 'SG', 
@@ -200,26 +200,6 @@ class RookieRankerEngine:
         adjusted_prod = raw_prod * np.where(df['Difficulty_Coef'] > 1, df['Difficulty_Coef'], 0.95)
         df['Score_Prod'] = self.normalize_score(adjusted_prod, scale_factor=4.5)
 
-        # === 维度 2：进攻效率 ===
-        if 'FGA' in df.columns and 'FTA' in df.columns:
-            df['TSA'] = df['FGA'] + 0.44 * df['FTA']
-        else:
-            df['TSA'] = 0.0
-
-        df['Pos_Avg_TS'] = df.groupby('Calc_Pos')['TS_PCT'].transform('mean')
-        rotation_mask = df['MIN'] >= 12.0
-        if rotation_mask.any():
-            pos_avg_map = df[rotation_mask].groupby('Calc_Pos')['TS_PCT'].mean()
-            df['Pos_Avg_TS'] = df['Calc_Pos'].map(pos_avg_map)
-            df['Pos_Avg_TS'] = df['Pos_Avg_TS'].fillna(df['TS_PCT'].mean())
-        else:
-            df['Pos_Avg_TS'] = df.groupby('Calc_Pos')['TS_PCT'].transform('mean')
-
-        df['TS_Diff'] = (df['TS_PCT'] - df['Pos_Avg_TS']) * 100 
-        raw_eff = df['TSA'] * 2 * (df['TS_PCT'] - df['Pos_Avg_TS'])
-        raw_eff = np.where(raw_eff < 0, raw_eff * 0.5, raw_eff)
-        raw_eff = np.sign(raw_eff) * np.log1p(np.abs(raw_eff))
-        df['Score_Eff'] = self.normalize_score(raw_eff, scale_factor=1.5)
 
         # === 维度 3：防守贡献 ===
         df['Z_PF_Inv'] = df.groupby('Calc_Pos')['PF'].transform(lambda x: (x.mean() - x) / (x.std() + 1e-6))
@@ -235,16 +215,41 @@ class RookieRankerEngine:
         df['Score_TO'] = self.normalize_score(adjusted_ast_to, scale_factor=2)
 
         # === 维度 5：球队贡献 ===
+        # === 维度 5：球队贡献 (引入样本量置信度) ===
+        # 修复痛点：防止"打1场表现好"的球员拿到和"打10场表现稳定"球员一样的高分
+
+        # 1. 计算 PIE 的 Z-Score (同位置内卷)
         if 'PIE' in df.columns:
-            df['Z_PIE'] = df.groupby('Calc_Pos')['PIE'].transform(lambda x: (x - x.mean()) / (x.std() + 1e-6))
+            # 填充空值为 0
+            df['PIE'] = df['PIE'].fillna(0)
+            # 计算 Z-Score
+            df['Z_PIE'] = df.groupby('Calc_Pos')['PIE'].transform(
+                lambda x: (x - x.mean()) / (x.std() + 1e-6)
+            )
         else:
             df['Z_PIE'] = 0
-        raw_team = df['Z_PIE']
-        df['Score_Team'] = self.normalize_score(raw_team, scale_factor=1.5)
 
-        # === 维度 6：出勤 (指数幂律模型) ===
-        # 修改为指数(幂函数)增长模式，范围 0-100
-        # Formula: 100 * (GP / Max_GP) ^ 2.5
+        # 2. 计算原始得分 (Raw Score)
+        # 基准分 70，缩放因子 1.5
+        raw_team_score = self.normalize_score(df['Z_PIE'], scale_factor=1.5)
+
+        # 3. 应用样本量置信度 (Sample Size Confidence)
+        # 逻辑：对于"球队贡献"来说，出勤过少意味着没有实质贡献。
+        # 设定阈值：5场。少于5场时，分数会线性衰减至 40 分(地板分)。
+        # 例：GP=1, Raw=70 -> Confidence=0.2 -> 40 + (30*0.2) = 46分 (大幅降低)
+        # 例：GP=5, Raw=70 -> Confidence=1.0 -> 70分 (恢复正常)
+        confidence_threshold = 5
+        df['Team_Confidence'] = (df['GP'] / confidence_threshold).clip(0, 1)
+
+        # 线性插值计算最终分
+        # score = floor + (raw - floor) * confidence
+        df['Score_Team'] = 40 + (raw_team_score - 40) * df['Team_Confidence']
+
+        # 再次截断，防止溢出
+        df['Score_Team'] = df['Score_Team'].clip(40, 100)
+
+        # === 维度 6：出勤 (改进型 S 曲线 - 更宽容) ===
+        # 优化目标：75% 出勤率时分数提升至 ~90 分，50% 出勤率保持 50 分
         if not consistency_df.empty:
             df = pd.merge(df, consistency_df, on='PLAYER_ID', how='left')
             df['GmSc_Std'] = df['GmSc_Std'].fillna(10)
@@ -254,19 +259,22 @@ class RookieRankerEngine:
         max_gp = df['GP'].max()
         if pd.isna(max_gp) or max_gp == 0:
             max_gp = 1
-        
-        # 幂律计算：k=2.5
-        # GP=1, Max=20 -> (0.05)^2.5 = 0.0005 -> 0.05分
-        # GP=10, Max=20 -> (0.5)^2.5 = 0.176 -> 17.6分
-        # GP=18, Max=20 -> (0.9)^2.5 = 0.768 -> 76.8分
-        k_exponent = 2.5
-        df['Score_GP_Exp'] = 100 * ((df['GP'] / max_gp) ** k_exponent)
-        
-        # 稳定性加成 (作为微调，最大加5分)
+
+        # 1. 计算基础出勤比例
+        x = df['GP'] / max_gp
+
+        # 2. 应用 Improved Smoothstep 算法
+        # 公式：6x^5 - 15x^4 + 10x^3
+        # 特点：比之前的方案更平滑，头部宽容度更高
+        df['Score_GP_Exp'] = 100 * ((6 * x ** 5) - (15 * x ** 4) + (10 * x ** 3))
+
+        # 3. 稳定性加成 (最大加5分)
         df['Bonus_Consist'] = (10 - df['GmSc_Std']).clip(0, 10) / 2
-        
+
+        # 4. 合成最终得分
         df['Score_Dura'] = df['Score_GP_Exp'] + df['Bonus_Consist']
-        # 取消 40 分限制，改为 0-100
+
+        # 5. 最终截断
         df['Score_Dura'] = df['Score_Dura'].clip(0, 100)
 
         # === 总分计算 ===
