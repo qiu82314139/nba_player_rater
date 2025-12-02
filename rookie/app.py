@@ -23,7 +23,7 @@ ROOKIE_POSITIONS = {
     'Ace Bailey': 'SF/PF', 'Tre Johnson': 'SG', 'Jeremiah Fears': 'PG', 'Egor Dëmin': 'PG/SF',
     'Collin Murray-Boyles': 'PF/C', 'Khaman Maluach': 'C', 'Cedric Coward': 'SF/PF', 'Noa Essengue': 'PF',
     'Derik Queen': 'C', 'Carter Bryant': 'SF/PF', 'Thomas Sorber': 'C', 'Yang Hansen': 'C',
-    'Joan Beringer': 'C/PF', 'Walter Clayton Jr.': 'PG/SG', 'Nolan Traoré': 'PG', 'Kasparas Jakučionis': 'PG',
+    'Joan Beringer': 'C/PF', 'Walter Clayton Jr.': 'PG/SG', 'Nolan Traore': 'PG', 'Kasparas Jakučionis': 'PG',
     'Will Riley': 'SF', 'Drake Powell': 'SF/SG', 'Asa Newell': 'PF', 'Nique Clifford': 'SG/SF',
     'Jase Richardson': 'PG/SG', 'Ben Saraf': 'PG/SG', 'Danny Wolf': 'C/PF', 'Hugo González': 'SF',
     'Liam McNeeley': 'SF', 'Yanic Konan Niederhäuser': 'C',
@@ -48,7 +48,7 @@ ROOKIE_CN_NAMES = {
     'Khaman Maluach': '卡曼·马鲁阿奇', 'Cedric Coward': '塞德里克·考沃德', 'Noa Essengue': '诺亚·埃森格',
     'Derik Queen': '德里克·奎恩', 'Carter Bryant': '卡特·科比', 'Thomas Sorber': '托马斯·索伯', 
     'Yang Hansen': '杨瀚森', 'Joan Beringer': '琼·贝林格', 'Walter Clayton Jr.': '沃尔特·克莱顿', 
-    'Nolan Traoré': '诺兰·特拉奥雷', 'Kasparas Jakučionis': '卡斯帕拉斯·雅库乔尼斯', 'Will Riley': '威尔·莱利', 
+    'Nolan Traore': '诺兰·特拉奥雷', 'Kasparas Jakučionis': '卡斯帕拉斯·雅库乔尼斯', 'Will Riley': '威尔·莱利',
     'Drake Powell': '德雷克·鲍威尔', 'Asa Newell': '阿萨·纽维尔', 'Nique Clifford': '尼克·克利福德',
     'Jase Richardson': '杰斯·理查德森', 'Ben Saraf': '本·萨拉夫', 'Danny Wolf': '丹尼·沃尔夫', 
     'Hugo González': '雨果·冈萨雷斯', 'Liam McNeeley': '利亚姆·麦克尼利', 'Yanic Konan Niederhäuser': '亚尼克·科南·尼德豪瑟',
@@ -200,6 +200,26 @@ class RookieRankerEngine:
         adjusted_prod = raw_prod * np.where(df['Difficulty_Coef'] > 1, df['Difficulty_Coef'], 0.95)
         df['Score_Prod'] = self.normalize_score(adjusted_prod, scale_factor=4.5)
 
+        # === 维度 2：进攻效率 ===
+        if 'FGA' in df.columns and 'FTA' in df.columns:
+            df['TSA'] = df['FGA'] + 0.44 * df['FTA']
+        else:
+            df['TSA'] = 0.0
+
+        df['Pos_Avg_TS'] = df.groupby('Calc_Pos')['TS_PCT'].transform('mean')
+        rotation_mask = df['MIN'] >= 12.0
+        if rotation_mask.any():
+            pos_avg_map = df[rotation_mask].groupby('Calc_Pos')['TS_PCT'].mean()
+            df['Pos_Avg_TS'] = df['Calc_Pos'].map(pos_avg_map)
+            df['Pos_Avg_TS'] = df['Pos_Avg_TS'].fillna(df['TS_PCT'].mean())
+        else:
+            df['Pos_Avg_TS'] = df.groupby('Calc_Pos')['TS_PCT'].transform('mean')
+
+        df['TS_Diff'] = (df['TS_PCT'] - df['Pos_Avg_TS']) * 100
+        raw_eff = df['TSA'] * 2 * (df['TS_PCT'] - df['Pos_Avg_TS'])
+        raw_eff = np.where(raw_eff < 0, raw_eff * 0.5, raw_eff)
+        raw_eff = np.sign(raw_eff) * np.log1p(np.abs(raw_eff))
+        df['Score_Eff'] = self.normalize_score(raw_eff, scale_factor=1.5)
 
         # === 维度 3：防守贡献 ===
         df['Z_PF_Inv'] = df.groupby('Calc_Pos')['PF'].transform(lambda x: (x.mean() - x) / (x.std() + 1e-6))
